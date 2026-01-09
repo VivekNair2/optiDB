@@ -5,12 +5,43 @@ from agno.models.openai import OpenAIChat
 from dotenv import load_dotenv
 import os
 import re
+import time
+import psycopg
+from datetime import datetime
+from parser import parse_logs
+
 load_dotenv()
 
 os.environ['GOOGLE_API_KEY'] = os.getenv('GOOGLE_API_KEY')
 os.environ['OPENAI_API_KEY'] = os.getenv('OPENAI_API_KEY')
 
 db_url = "postgresql+psycopg://ai_user:secret@localhost:5432/unoptimized_db"
+
+# Helper function to get live query workload
+def get_live_queries():
+    """Fetch currently running queries from the database."""
+    try:
+        conn_info = "host=localhost port=5432 dbname=unoptimized_db user=ai_user password=secret"
+        with psycopg.connect(conn_info) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        pid,
+                        usename,
+                        state,
+                        EXTRACT(EPOCH FROM (now() - query_start)) AS running_time,
+                        query_start,
+                        LEFT(query, 150) AS query
+                    FROM pg_stat_activity
+                    WHERE state != 'idle'
+                    ORDER BY running_time DESC
+                    LIMIT 10;
+                """)
+                results = cur.fetchall()
+                return results if results else []
+    except Exception as e:
+        # Return error tuple for debugging
+        return {"error": str(e)}
 
 # Helper function to extract optimized SQL from agent output
 def extract_optimized_sql(text: str) -> str:
@@ -617,7 +648,69 @@ if 'optimization_result' in st.session_state:
 
 # Sidebar
 with st.sidebar:
-    st.markdown("### 💡 How It Works")
+    st.markdown("### 📊 Query Logs Analysis")
+    st.caption(f"🔄 Auto-refreshes every 3 seconds")
+    
+    # Try to parse query logs
+    try:
+        # PostgreSQL log directory
+        log_dir = r"C:\Program Files\PostgreSQL\17\data\log"
+        
+        # Find the latest log file
+        log_file_path = None
+        if os.path.exists(log_dir):
+            log_files = [f for f in os.listdir(log_dir) if f.endswith('.log')]
+            if log_files:
+                # Get the most recent log file
+                latest_log = max(log_files, key=lambda f: os.path.getmtime(os.path.join(log_dir, f)))
+                log_file_path = os.path.join(log_dir, latest_log)
+                st.caption(f"📄 Reading: {latest_log}")
+        
+        if not log_file_path:
+            st.warning("""⚠️ PostgreSQL log file not found. 
+            
+**To enable query logging:**
+1. Find your `postgresql.conf` file
+2. Add these lines:
+```
+log_duration = on
+log_statement = 'all'
+log_min_duration_statement = 0
+```
+3. Restart PostgreSQL
+            """)
+        
+        if log_file_path:
+            query_logs = parse_logs(log_file_path)
+        
+            if query_logs:
+                # Sort by duration descending
+                query_logs_sorted = sorted(query_logs, key=lambda x: x['duration_ms'], reverse=True)
+                
+                st.success(f"✓ {len(query_logs)} Queries Logged")
+                
+                # Show top 10 slowest queries
+                st.markdown("**🐌 Top Slow Queries**")
+                for i, log in enumerate(query_logs_sorted[:10]):
+                    duration_display = f"{log['duration_ms']:.2f}ms"
+                    query_snippet = log['query'][:100]
+                    
+                    # Color code by duration
+                    duration_color = "🔴" if log['duration_ms'] > 1000 else "🟡" if log['duration_ms'] > 100 else "🟢"
+                    
+                    with st.expander(f"{duration_color} {log['user']}@{log['database']} • {duration_display}", expanded=False):
+                        st.caption(f"**Time:** {log['timestamp']}")
+                        st.code(query_snippet, language="sql")
+            else:
+                st.info("✓ No query logs found in file")
+    except FileNotFoundError:
+        st.warning("⚠️ Log file not found at specified path.")
+    except Exception as e:
+        st.error(f"❌ Error parsing logs: {str(e)}")
+    
+    st.markdown("---")
+    
+    st.markdown("### �💡 How It Works")
     st.markdown("""
     **1️⃣ Describe Your Goal**  
     Explain what data you need
@@ -681,3 +774,12 @@ with st.sidebar:
         if 'manual_result' in st.session_state:
             st.markdown("**Result:**")
             st.code(st.session_state['manual_result'])
+
+# Auto-refresh mechanism
+if 'last_refresh' not in st.session_state:
+    st.session_state['last_refresh'] = time.time()
+
+# Refresh every 3 seconds
+if time.time() - st.session_state['last_refresh'] > 3:
+    st.session_state['last_refresh'] = time.time()
+    st.rerun()

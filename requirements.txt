@@ -1,0 +1,6 @@
+streamlit
+agno
+psycopg[binary]
+python-dotenv
+openai
+sqlalchemy

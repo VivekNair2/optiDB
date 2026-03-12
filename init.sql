@@ -1,3 +1,6 @@
+-- Enable query statistics tracking
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
 -- Create sample tables for testing the SQL optimizer
 
 -- Users table

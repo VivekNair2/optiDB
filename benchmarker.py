@@ -3,13 +3,14 @@ import re
 import json
 import statistics
 from datetime import datetime
+import logging
+
+logger = logging.getLogger("optidb_app")
 
 
 def get_connection(db_host):
     """Create a database connection."""
-    conn_info = (
-        f"host={db_host} port=5432 dbname=unoptimized_db user=ai_user password=secret"
-    )
+    conn_info = f"host={db_host} port=5432 dbname=unoptimized_db user=ai_user password=secret options='-c statement_timeout=30000'"
     return psycopg.connect(conn_info, autocommit=True)
 
 
@@ -120,13 +121,15 @@ def benchmark_query(db_host, query, runs=5, warmup=2):
     if not select_query:
         return {"error": "No SELECT statement found to benchmark"}
 
-    conn_info = (
-        f"host={db_host} port=5432 dbname=unoptimized_db user=ai_user password=secret"
-    )
+    conn_info = f"host={db_host} port=5432 dbname=unoptimized_db user=ai_user password=secret options='-c statement_timeout=30000'"
     applied_ddl = []
 
     # --- Step 1: apply DDL on its own dedicated connection -----------------
     if ddl_stmts:
+        logger.info(
+            "Applying DDL statements before benchmarking: %d statement(s)",
+            len(ddl_stmts),
+        )
         try:
             with psycopg.connect(conn_info, autocommit=True) as ddl_conn:
                 with ddl_conn.cursor() as cur:
@@ -149,13 +152,15 @@ def benchmark_query(db_host, query, runs=5, warmup=2):
 
     # --- Step 2: benchmark on a *fresh* connection (no DDL residue) ---------
     results = []
+    logger.info("Starting benchmark (Runs: %d, Warmups: %d)", runs, warmup)
     try:
         with psycopg.connect(conn_info, autocommit=True) as bench_conn:
             # Warmup runs (not counted)
             for _ in range(warmup):
                 try:
                     run_explain_analyze(bench_conn, select_query)
-                except Exception:
+                except Exception as e:
+                    logger.warning("Warmup run failed: %s", e)
                     pass
 
             # Measured runs
@@ -166,8 +171,10 @@ def benchmark_query(db_host, query, runs=5, warmup=2):
                     metrics["run_number"] = i + 1
                     results.append(metrics)
                 except Exception as e:
+                    logger.error("Benchmark run %d failed: %s", i + 1, e)
                     results.append({"error": str(e), "run_number": i + 1})
     except Exception as e:
+        logger.error("Benchmark connection error: %s", e)
         return {"error": f"Benchmark connection error: {e}"}
 
     # Filter successful runs
@@ -218,29 +225,38 @@ def benchmark_query(db_host, query, runs=5, warmup=2):
 
 
 def _drop_optimization_indexes(db_host, optimized_query):
-    """Drop any indexes that the optimized query would CREATE, so the original
-    query can be benchmarked in a clean (no-optimization-index) state."""
+    """Drop any indexes or materialized views that the optimized query would CREATE,
+    so the original query can be benchmarked in a clean (pre-optimization) state."""
     ddl_stmts, _ = split_ddl_and_query(optimized_query)
     if not ddl_stmts:
         return
 
     drop_stmts = []
     for stmt in ddl_stmts:
-        # Match: CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] <name> ON ...
-        m = re.search(
+        # Match: CREATE [UNIQUE] INDEX ...
+        m_idx = re.search(
             r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON",
             stmt,
             re.IGNORECASE,
         )
-        if m:
-            drop_stmts.append(f"DROP INDEX IF EXISTS {m.group(1)};")
+        if m_idx:
+            drop_stmts.append(f"DROP INDEX IF EXISTS {m_idx.group(1)};")
+
+        # Match: CREATE MATERIALIZED VIEW ...
+        m_mv = re.search(
+            r"CREATE\s+(?:MATERIALIZED\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
+            stmt,
+            re.IGNORECASE,
+        )
+        if m_mv:
+            is_mat = "MATERIALIZED" in stmt.upper()
+            mat_str = "MATERIALIZED " if is_mat else ""
+            drop_stmts.append(f"DROP {mat_str}VIEW IF EXISTS {m_mv.group(1)} CASCADE;")
 
     if not drop_stmts:
         return
 
-    conn_info = (
-        f"host={db_host} port=5432 dbname=unoptimized_db user=ai_user password=secret"
-    )
+    conn_info = f"host={db_host} port=5432 dbname=unoptimized_db user=ai_user password=secret options='-c statement_timeout=30000'"
     with psycopg.connect(conn_info, autocommit=True) as conn:
         with conn.cursor() as cur:
             for stmt in drop_stmts:
@@ -251,17 +267,15 @@ def _drop_optimization_indexes(db_host, optimized_query):
 
 
 def compare_queries(db_host, original_query, optimized_query, runs=5, warmup=2):
-    """Run benchmarks on both queries and return comparison data.
-
-    Drops any indexes that the optimized query would create before benchmarking
-    the original query, so the two runs reflect genuinely different plans.
-    After the original is benchmarked, benchmark_query() re-creates those indexes
-    as part of benchmarking the optimized query.
-    """
+    """Run benchmarks on both queries and return comparison data."""
+    logger.info("Initializing query comparison: Original vs Optimized")
     # Ensure original runs without the optimization indexes (fair baseline)
     _drop_optimization_indexes(db_host, optimized_query)
 
+    logger.info("Benchmarking ORIGINAL query...")
     original_result = benchmark_query(db_host, original_query, runs, warmup)
+
+    logger.info("Benchmarking OPTIMIZED query...")
     optimized_result = benchmark_query(db_host, optimized_query, runs, warmup)
 
     comparison = {
@@ -309,29 +323,64 @@ def format_benchmark_report(comparison):
     orig = comparison["original"]
     opt = comparison["optimized"]
 
-    if "error" in orig:
-        lines.append(f"**Original query error:** {orig['error']}")
-        if "details" in orig:
-            run_errors = [r.get("error") for r in orig["details"] if "error" in r]
-            if run_errors:
-                lines.append(f"**Run exception:** `{run_errors[0]}`")
-        return "\n".join(lines)
-    if "error" in opt:
-        lines.append(f"**Optimized query error:** {opt['error']}")
-        if "details" in opt:
-            run_errors = [r.get("error") for r in opt["details"] if "error" in r]
-            if run_errors:
-                lines.append(f"**Run exception:** `{run_errors[0]}`")
-        return "\n".join(lines)
+    # The actual "timeout" string might be hiding inside the "details" array
+    # instead of the main "error" string (which usually says "All benchmark runs failed").
+    orig_error_text = str(orig.get("error", "")) + " " + str(orig.get("details", ""))
+    orig_timeout = "timeout" in orig_error_text.lower() if "error" in orig else False
 
-    # Show DDL applied before optimized benchmark
+    # Show DDL applied before optimized benchmark early so it's always visible
     applied_ddl = opt.get("applied_ddl", [])
     if applied_ddl:
-        lines.append("## Indexes Applied Before Benchmarking")
+        lines.append("## Setup: Indexes Applied Before Benchmarking")
         lines.append("")
         for stmt in applied_ddl:
             lines.append(f"```sql\n{stmt}\n```")
         lines.append("")
+
+    if "error" in orig and not orig_timeout:
+        lines.append("### ❌ Original Query Failed (Execution Error)")
+        lines.append(f"> `{orig['error']}`")
+        if "details" in orig:
+            run_errors = [r.get("error") for r in orig["details"] if "error" in r]
+            if run_errors:
+                lines.append(f"**Exception Details:** `{run_errors[0]}`")
+        return "\n".join(lines)
+
+    if "error" in opt:
+        lines.append("### ❌ Optimized Query Failed (Execution Error)")
+        lines.append(f"> `{opt['error']}`")
+        if "details" in opt:
+            run_errors = [r.get("error") for r in opt["details"] if "error" in r]
+            if run_errors:
+                lines.append(f"**Exception Details:** `{run_errors[0]}`")
+        return "\n".join(lines)
+
+    if orig_timeout:
+        lines.append("## 🚨 Timeout Analysis")
+        lines.append(
+            "> The **Original Query** was severely unoptimized and exceeded the database safety circuit-breaker of **30 seconds**. This indicates a catastrophic execution plan (endless nested loops or massive unindexed scans) that would typically lock up the entire production database."
+        )
+        lines.append("")
+        lines.append("### 🏆 Optimizer Results")
+        lines.append(
+            f"The optimized query processed successfully in **{opt.get('execution_time_ms', 0):.2f} ms**!"
+        )
+        lines.append("")
+        lines.append("| Metric | Status |")
+        lines.append("|--------|--------|")
+        lines.append(
+            f"| **Execution Time** | {opt.get('execution_time_ms', 0):.3f} ms |"
+        )
+        lines.append(f"| **Estimated Cost** | {opt.get('total_cost', 0):.2f} |")
+        lines.append(f"| **Rows Returned**  | {opt.get('actual_rows', 0)} |")
+        lines.append(f"| **Sequential Scans** | {opt.get('seq_scan_count', 0)} |")
+        lines.append(f"| **Index Scans** | {opt.get('index_scan_count', 0)} |")
+        if opt.get("index_scan_tables"):
+            lines.append("")
+            lines.append(
+                f"**Indexes Leveraged:** {', '.join(opt['index_scan_tables'])}"
+            )
+        return "\n".join(lines)
 
     # Summary table
     lines.append("## Performance Comparison")

@@ -1,9 +1,17 @@
 import streamlit as st
+import logging
 from dotenv import load_dotenv
 import os
 import re
 import psycopg
 import pandas as pd
+
+# Configure logging for Docker visibility
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("optidb_app")
+
 from workload import (
     get_query_workload,
     get_schema_summary,
@@ -35,6 +43,7 @@ db_url = f"postgresql+psycopg://ai_user:secret@{db_host}:5432/unoptimized_db"
 def gather_query_context(sql: str) -> str:
     """Pre-fetch schema, workload, pg_indexes and EXPLAIN ANALYZE as plain text
     for the optimizer prompt so the agent has full context."""
+    logger.info("Gathering query context for optimization task.")
     conn_info = (
         f"host={db_host} port=5432 dbname=unoptimized_db user=ai_user password=secret"
     )
@@ -64,7 +73,7 @@ def gather_query_context(sql: str) -> str:
     except Exception as e:
         lines.append(f"\n=== RECENT QUERY WORKLOAD ===\n  (failed: {e})")
 
-    # 3. All existing indexes
+    # 3. All existing indexes and materialized views
     try:
         with psycopg.connect(conn_info) as conn:
             with conn.cursor() as cur:
@@ -81,6 +90,18 @@ def gather_query_context(sql: str) -> str:
                 if rows:
                     for tbl, idx, defn in rows:
                         lines.append(f"  {tbl}: {idx} — {defn}")
+                else:
+                    lines.append("  (none found)")
+
+                # Fetch Materialized Views
+                cur.execute(
+                    "SELECT matviewname, definition FROM pg_matviews WHERE schemaname = 'public';"
+                )
+                mvs = cur.fetchall()
+                lines.append("\n=== EXISTING MATERIALIZED VIEWS ===")
+                if mvs:
+                    for mv_name, defn in mvs:
+                        lines.append(f"  Name: {mv_name}\n  Definition: {defn.strip()}")
                 else:
                     lines.append("  (none found)")
 
@@ -102,6 +123,7 @@ def execute_sql_directly(sql: str):
     """Execute a SQL block (optionally prefixed with DDL) directly via psycopg.
     Applies DDL statements first, then runs the SELECT and returns (columns, rows, error).
     """
+    logger.info("Executing SQL directly (length: %d chars)", len(sql))
     conn_info = (
         f"host={db_host} port=5432 dbname=unoptimized_db user=ai_user password=secret"
     )
@@ -184,29 +206,33 @@ def extract_optimized_sql(text: str) -> str:
 
 sql_optimizer_agent = Agent(
     model=OpenAIChat(id="gpt-4o"),
-    tools=[SQLTools(db_url=db_url)],
+    tools=[],  # Context is already fully passed explicitly, no need for SQLTools to prevent tool loop overhead
     instructions=[
-        "You are a senior PostgreSQL performance engineer.",
-        "STEP 1 — UNDERSTAND THE SCHEMA: Use describe_table on every table in the query.",
-        "STEP 2 — CHECK EXISTING INDEXES: Run:",
-        "  SELECT indexname, tablename, indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY tablename, indexname;",
-        "  Do NOT assume any indexes exist — only trust what this query returns.",
-        "STEP 3 — GET THE QUERY PLAN: Run EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) on the original query.",
-        "STEP 4 — IDENTIFY REAL ISSUES based on the actual plan and actual indexes:",
-        "  - Sequential scans on filtered columns with no index → CREATE INDEX",
-        "  - Implicit comma joins → rewrite with explicit JOIN",
-        "  - Non-sargable predicates → fix predicate",
-        "  - SELECT * → list only needed columns",
-        "STEP 5 — OUTPUT in this exact format:",
+        "You are a senior PostgreSQL performance engineer and query rewriter.",
+        "STEP 1 — VALIDATE INTENT: Check if the 'Unoptimized SQL Query' logically attempts to solve the 'Task'. If there is a complete semantic mismatch (e.g., Task asks for customers, SQL queries parts), STOP. Do not output anything else except:",
+        "  ### Mismatch Error",
+        "  <Explanation of why the SQL and Task do not match>",
+        "STEP 2 — REVIEW THE CONTEXT: Read the provided Database Schema, Workload, Existing Indexes, Existing Materialized Views, and EXPLAIN plan.",
+        "STEP 3 — IDENTIFY REAL ISSUES: Base your analysis purely on the actual EXPLAIN plan and existing indexes in the context.",
+        "STEP 4 — PLAN OPTIMIZATIONS (DDL + REWRITE):",
+        "  - Missing Access Paths → Suggest CREATE INDEX or CREATE MATERIALIZED VIEW for heavily filtered/joined columns or expensive aggregations.",
+        "  - Non-Sargable Predicates → Rewrite function calls in WHERE clauses (e.g., DATE_TRUNC) to direct range comparisons (e.g., >= AND <).",
+        "  - Subquery Flattening → Rewrite IN / NOT IN subqueries to EXISTS / NOT EXISTS or LEFT JOIN for better plan execution.",
+        "  - Grouping Optimization → Push down aggregations into CTEs to reduce rows early before joining with massive tables.",
+        "  - Legacy Syntax → Replace implicit comma joins (FROM a,b) with explicit JOIN ... ON clauses.",
+        "  - Existing MVs → If a Materialized View already covers this data or is suggested, rewrite the query to query the MV instead of raw tables.",
+        "STEP 5 — OUTPUT format exactly like this:",
         "  ### Findings",
-        "  ### Missing Indexes",
+        "  ### Recommendations (Indexes / MVs)",
         "  ### Optimized Query",
         "  ```sql",
-        "  <CREATE INDEX statements first, then the SELECT>",
+        "  <Put CREATE INDEX or CREATE MATERIALIZED VIEW statements here if needed, separated by semicolons>",
+        "  ",
+        "  <Put the REWRITTEN SELECT query here>",
         "  ```",
         "  ### Explanation",
-        "CRITICAL: Include CREATE INDEX DDL inside the ```sql block before the SELECT.",
-        "CRITICAL: Base analysis on actual pg_indexes output, not assumptions.",
+        "CRITICAL: DDL statements (if any) MUST be inside the exact same ```sql block as the REWRITTEN SELECT statement. Put the DDL first.",
+        "CRITICAL: Do NOT invent indexes that already exist in the context.",
     ],
     markdown=True,
 )
@@ -226,6 +252,10 @@ executor_agent = Agent(
 
 # ─── App layout ───────────────────────────────────────────────────────────────
 
+if "app_init" not in st.session_state:
+    logger.info("Streamlit app initialized. Connecting to DB at %s", db_host)
+    st.session_state["app_init"] = True
+
 st.set_page_config(page_title="DB Optimizer Agent", page_icon="🧠", layout="wide")
 st.title("🧠 AI Database Optimizer")
 st.caption(
@@ -233,12 +263,11 @@ st.caption(
 )
 st.divider()
 
-tab1, tab2, tab3, tab4 = st.tabs(
+tab1, tab2, tab3 = st.tabs(
     [
         "📊 Workload Monitor",
         "🤖 Analyze & Approve",
-        "🔧 Query Optimizer",
-        "✍️ Query Rewriter",
+        "🔧 Query Optimizer & Rewriter",
     ]
 )
 
@@ -250,19 +279,23 @@ with tab1:
 
     col1, col2, col3 = st.columns([1, 1, 5])
     with col1:
-        if st.button("🔄 Refresh", use_container_width=True):
+        if st.button("🔄 Refresh", width="stretch"):
+            logger.info("User manually refreshed workload monitor (Tab 1)")
             st.rerun()
     with col2:
         if st.button(
             "🗑️ Reset Stats",
-            use_container_width=True,
+            width="stretch",
             help="Clears pg_stat_statements history",
         ):
+            logger.info("User requested pg_stat_statements reset (Tab 1)")
             try:
                 reset_stats()
+                logger.info("Stats reset successfully")
                 st.success("Stats reset!")
                 st.rerun()
             except Exception as e:
+                logger.error("Failed to reset stats: %s", e)
                 st.error(f"Reset failed: {e}")
 
     st.divider()
@@ -303,10 +336,12 @@ with tab2:
     )
 
     if st.button("🤖 Run Analysis", type="primary"):
+        logger.info("User initiated AI Workload Analysis (Tab 2)")
         with st.spinner("Fetching workload and schema, then running AI analysis..."):
             try:
                 workload = get_query_workload()
                 if not workload:
+                    logger.warning("Workload analysis aborted: No workload data found")
                     st.warning(
                         "No workload data found. Run some queries first, then come back."
                     )
@@ -338,6 +373,10 @@ with tab2:
 
                 response = workload_optimizer_agent.run(prompt)
                 plan = response.content
+                logger.info(
+                    "AI Analysis completed successfully. Found %d recommendations.",
+                    len(getattr(plan, "ddl_recommendations", [])),
+                )
                 st.session_state["plan"] = plan
                 st.session_state["approvals"] = {
                     i: None for i in range(len(plan.ddl_recommendations))
@@ -345,6 +384,7 @@ with tab2:
                 st.session_state.pop("exec_results", None)
 
             except Exception as e:
+                logger.error("AI Analysis failed: %s", e)
                 st.error(f"Analysis failed: {e}")
 
     if "plan" in st.session_state:
@@ -374,18 +414,22 @@ with tab2:
                         if st.button(
                             "✅ Approve",
                             key=f"approve_{i}",
-                            use_container_width=True,
+                            width="stretch",
                             type="primary",
                         ):
+                            logger.info(
+                                "User approved DDL recommendation: %s", rec.name
+                            )
                             st.session_state["approvals"][i] = "approved"
                             st.rerun()
 
                     with right_reject:
                         st.write("")
                         st.write("")
-                        if st.button(
-                            "❌ Reject", key=f"reject_{i}", use_container_width=True
-                        ):
+                        if st.button("❌ Reject", key=f"reject_{i}", width="stretch"):
+                            logger.info(
+                                "User rejected DDL recommendation: %s", rec.name
+                            )
                             st.session_state["approvals"][i] = "rejected"
                             st.rerun()
 
@@ -405,13 +449,20 @@ with tab2:
                     f"⚡ Execute {len(approved_indices)} Approved Change(s)",
                     type="primary",
                 ):
+                    logger.info(
+                        "Executing %d approved DDL changes...", len(approved_indices)
+                    )
                     results = []
                     for i in approved_indices:
                         rec = plan.ddl_recommendations[i]
                         try:
                             execute_ddl(rec.ddl)
+                            logger.info("Successfully applied DDL: %s", rec.name)
                             results.append((rec.name, True, None))
                         except Exception as e:
+                            logger.error(
+                                "Failed to apply DDL '%s': %s", rec.name, str(e)
+                            )
                             results.append((rec.name, False, str(e)))
                     st.session_state["exec_results"] = results
 
@@ -442,11 +493,11 @@ with tab2:
                     st.markdown(f"**Why it's faster:** {rw.explanation}")
 
 
-# ─── Tab 3: Query Optimizer (with Benchmark) ──────────────────────────────────
+# ─── Tab 3: Query Optimizer & Rewriter ────────────────────────────────────────
 with tab3:
-    st.subheader("SQL Query Optimizer")
+    st.subheader("SQL Query Optimizer & Rewriter")
     st.caption(
-        "Analyze, optimize, and benchmark individual SQL queries with AI-powered insights"
+        "Analyze, rewrite, optimize, and benchmark individual SQL queries with AI-powered insights"
     )
 
     task = st.text_area(
@@ -463,29 +514,51 @@ with tab3:
         key="optimizer_sql",
     )
 
+    # Action Buttons
     btn_col1, btn_col2, btn_col3 = st.columns(3)
     with btn_col1:
         optimize_btn = st.button(
-            "🚀 Analyze & Optimize", type="primary", use_container_width=True
+            "🚀 Analyze & Optimize", type="primary", width="stretch"
         )
     with btn_col2:
         execute_btn = st.button(
-            "▶️ Execute Optimized", type="secondary", use_container_width=True
+            "▶️ Execute Optimized", type="secondary", width="stretch"
         )
     with btn_col3:
         benchmark_btn = st.button(
             "📊 Benchmark",
-            use_container_width=True,
+            width="stretch",
             help="Compare original vs optimized with EXPLAIN ANALYZE",
         )
 
     st.markdown("---")
 
+    # View Toggles (only show if we have optimization results)
+    if "optimization_result" in st.session_state:
+        view_col1, view_col2, view_col3 = st.columns(3)
+        with view_col1:
+            show_opt = st.button("👁️ View Optimization Plan", width="stretch")
+        with view_col2:
+            show_exec = st.button("👁️ View Execution Results", width="stretch")
+        with view_col3:
+            show_bench = st.button("👁️ View Benchmark Results", width="stretch")
+
+        if show_opt:
+            st.session_state["tab3_view"] = "optimize"
+        if show_exec:
+            st.session_state["tab3_view"] = "execute"
+        if show_bench:
+            st.session_state["tab3_view"] = "benchmark"
+
     if optimize_btn:
         if task and unoptimized_sql:
+            logger.info(
+                "User requested Query Optimization (Tab 3) for task: %s", task[:50]
+            )
             st.session_state.pop("execution_result", None)
             st.session_state.pop("benchmark_report", None)
             st.session_state.pop("benchmark_data", None)
+            st.session_state["tab3_view"] = "optimize"
             st.session_state["original_sql"] = unoptimized_sql  # save for benchmark
             with st.spinner("🔍 Analyzing schema and optimizing query..."):
                 ctx = gather_query_context(unoptimized_sql)
@@ -519,63 +592,79 @@ write the exact CREATE INDEX statement. If no indexes are missing, say "None".
 ### Explanation
 For each change, state the before/after plan impact.
 """
+                logger.info("Sending query to SQL Optimizer Agent...")
                 response = sql_optimizer_agent.run(prompt)
-                st.session_state["optimization_result"] = response.content
-                optimized = extract_optimized_sql(response.content)
-                st.session_state["optimized_query"] = (
-                    optimized if optimized else unoptimized_sql
-                )
-                # Sync the editable text_area widget — without this the widget's
-                # key-based state takes precedence over the value= arg and
-                # immediately overwrites optimized_query with the stale/empty value.
-                st.session_state["optimized_display"] = st.session_state[
-                    "optimized_query"
-                ]
+
+                content = response.content
+                if "### Mismatch Error" in content:
+                    logger.warning("Mismatch error detected between task and query.")
+                    st.error("🚨 Task vs Query Mismatch")
+                    st.info(content.replace("### Mismatch Error", "").strip())
+                    # Clear any prior state so we don't show old results
+                    st.session_state.pop("optimization_result", None)
+                    st.session_state.pop("optimized_query", None)
+                else:
+                    st.session_state["optimization_result"] = content
+                    optimized = extract_optimized_sql(content)
+                    logger.info(
+                        "Optimizer returned. Extracted string length: %d",
+                        len(optimized) if optimized else 0,
+                    )
+                    st.session_state["optimized_query"] = (
+                        optimized if optimized else unoptimized_sql
+                    )
+                    # Sync the editable text_area widget
+                    st.session_state["optimized_display"] = st.session_state[
+                        "optimized_query"
+                    ]
         else:
             st.warning("⚠️ Please provide both a task description and SQL query")
 
     if execute_btn:
-        if st.session_state.get("optimized_query"):
-            with st.spinner("⚡ Executing optimized query..."):
-                cols, rows, err = execute_sql_directly(
-                    st.session_state["optimized_query"]
+        st.session_state["tab3_view"] = "execute"
+        logger.info("User executing optimized query (Tab 3)")
+        with st.spinner("⚡ Executing optimized query..."):
+            cols, rows, err = execute_sql_directly(st.session_state["optimized_query"])
+            if err:
+                logger.error("Optimized execution failed: %s", err)
+                st.session_state["execution_result"] = ("error", err)
+            elif not rows:
+                logger.info("Optimized execution succeeded (0 rows)")
+                st.session_state["execution_result"] = ("empty", cols)
+            else:
+                logger.info(
+                    "Optimized execution succeeded (%d rows returned)", len(rows)
                 )
-                if err:
-                    st.session_state["execution_result"] = ("error", err)
-                elif not rows:
-                    st.session_state["execution_result"] = ("empty", cols)
-                else:
-                    st.session_state["execution_result"] = ("data", cols, rows)
-        else:
-            st.warning("⚠️ Please optimize the query first")
+                st.session_state["execution_result"] = ("data", cols, rows)
 
     if benchmark_btn:
+        st.session_state["tab3_view"] = "benchmark"
         original_for_bench = st.session_state.get("original_sql") or unoptimized_sql
-        if original_for_bench and st.session_state.get("optimized_query"):
-            with st.spinner("Running benchmark (2 warmup + 5 measured runs)..."):
-                try:
-                    comparison = compare_queries(
-                        db_host,
-                        original_for_bench,
-                        st.session_state["optimized_query"],
-                        runs=5,
-                        warmup=2,
-                    )
-                    st.session_state["benchmark_report"] = format_benchmark_report(
-                        comparison
-                    )
-                    st.session_state["benchmark_data"] = comparison
-                except Exception as e:
-                    st.error(f"Benchmark failed: {e}")
-        elif not original_for_bench:
-            st.warning("Please paste your original SQL query and optimize first")
-        else:
-            st.warning("Please optimize the query first, then benchmark")
+        logger.info("User requested Benchmark comparison (Tab 3)")
+        with st.spinner("Running benchmark (2 warmup + 5 measured runs)..."):
+            try:
+                comparison = compare_queries(
+                    db_host,
+                    original_for_bench,
+                    st.session_state["optimized_query"],
+                    runs=5,
+                    warmup=2,
+                )
+                logger.info("Benchmark complete")
+                st.session_state["benchmark_report"] = format_benchmark_report(
+                    comparison
+                )
+                st.session_state["benchmark_data"] = comparison
+            except Exception as e:
+                st.error(f"Benchmark failed: {e}")
 
-    if "execution_result" in st.session_state:
+    # Rendering the appropriate section based on the last clicked button
+    view = st.session_state.get("tab3_view", "optimize")
+
+    if view == "execute" and "execution_result" in st.session_state:
         st.divider()
         st.subheader("✅ Query Results")
-        with st.expander("📋 View Executed SQL", expanded=False):
+        with st.expander("📋 View Executed SQL", expanded=True):
             st.code(st.session_state.get("optimized_query", ""), language="sql")
         result = st.session_state["execution_result"]
         if result[0] == "error":
@@ -585,124 +674,84 @@ For each change, state the before/after plan impact.
         else:
             _, cols, rows = result
             df = pd.DataFrame(rows, columns=cols)
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
             st.caption(f"{len(rows)} row(s) returned")
 
-    if "optimization_result" in st.session_state:
+    elif view == "optimize" and "optimization_result" in st.session_state:
         st.divider()
         st.subheader("📊 Optimization Report")
-        res_tab1, res_tab2, res_tab3 = st.tabs(
-            ["Analysis & Recommendations", "Optimized SQL", "Benchmark Results"]
-        )
 
-        with res_tab1:
+        col_main, col_sql = st.columns([1, 1], gap="large")
+
+        with col_main:
             st.markdown(st.session_state["optimization_result"])
 
-        with res_tab2:
+        with col_sql:
+            st.markdown("### 💻 Review & Edit Optimized SQL")
+            st.info("💡 Edit this query or click '▶️ Execute' or '📊 Benchmark' above.")
             optimized_query_display = st.text_area(
-                "Optimized SQL Query",
+                "Final SQL Editor",
                 value=st.session_state.get("optimized_query", ""),
-                height=250,
+                height=400,
                 key="optimized_display",
-                help="Review and edit the optimized query before execution",
+                label_visibility="collapsed",
             )
             st.session_state["optimized_query"] = optimized_query_display
-            st.info("💡 Click '▶️ Execute Optimized' above to run this SQL")
 
-        with res_tab3:
-            if "benchmark_report" in st.session_state:
-                st.markdown(st.session_state["benchmark_report"])
-                data = st.session_state.get("benchmark_data", {})
-                orig = data.get("original", {})
-                opt = data.get("optimized", {})
-                if "error" not in orig and "error" not in opt:
-                    st.divider()
-                    st.subheader("Timing Breakdown")
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        st.metric(
-                            "Original Execution Time",
-                            f"{orig['execution_time_ms']:.3f} ms",
-                        )
-                        st.metric("Original Total Cost", f"{orig['total_cost']:.2f}")
-                    with col_b:
-                        exec_delta = (
-                            orig["execution_time_ms"] - opt["execution_time_ms"]
-                        )
-                        cost_delta = orig["total_cost"] - opt["total_cost"]
-                        st.metric(
-                            "Optimized Execution Time",
-                            f"{opt['execution_time_ms']:.3f} ms",
-                            delta=(
-                                f"-{exec_delta:.3f} ms"
-                                if exec_delta > 0
-                                else f"+{abs(exec_delta):.3f} ms"
-                            ),
-                            delta_color="normal" if exec_delta > 0 else "inverse",
-                        )
-                        st.metric(
-                            "Optimized Total Cost",
-                            f"{opt['total_cost']:.2f}",
-                            delta=(
-                                f"-{cost_delta:.2f}"
-                                if cost_delta > 0
-                                else f"+{abs(cost_delta):.2f}"
-                            ),
-                            delta_color="normal" if cost_delta > 0 else "inverse",
-                        )
-            else:
-                st.info("Click '📊 Benchmark' above to run a performance comparison")
-
-
-# ─── Tab 4: Query Rewriter ────────────────────────────────────────────────────
-with tab4:
-    st.subheader("Rewrite a Query")
-    st.caption(
-        "Paste any query and the agent rewrites it to leverage available indexes and materialized views"
-    )
-
-    query_input = st.text_area(
-        "SQL Query:",
-        height=150,
-        placeholder="SELECT * FROM orders WHERE user_id = 123 ORDER BY created_at DESC;",
-    )
-    context_input = st.text_area(
-        "Additional context (optional):",
-        height=80,
-        placeholder="e.g. We just created an index on orders(user_id). Please rewrite to benefit from it.",
-    )
-
-    if st.button("✍️ Rewrite Query", type="primary"):
-        if query_input.strip():
-            with st.spinner("Rewriting..."):
-                try:
-                    schema = get_schema_summary()
-                    indexes = get_existing_indexes()
-                    index_str = (
-                        "\n".join(f"  - {r[0]}: {r[2]}" for r in indexes)
-                        if indexes
-                        else "  None"
-                    )
-                    context_section = (
-                        f"CONTEXT: {context_input}\n\n" if context_input.strip() else ""
-                    )
-                    prompt = (
-                        f"Rewrite this SQL query for better performance in PostgreSQL.\n\n"
-                        f"SCHEMA:\n{schema}\n\n"
-                        f"AVAILABLE INDEXES:\n{index_str}\n\n"
-                        f"{context_section}"
-                        f"QUERY TO REWRITE:\n{query_input}"
-                    )
-                    response = rewriter_agent.run(prompt)
-                    st.session_state["rewrite_result"] = response.content
-                except Exception as e:
-                    st.error(f"Rewrite failed: {e}")
-        else:
-            st.warning("Please enter a SQL query first")
-
-    if "rewrite_result" in st.session_state:
+    elif view == "benchmark" and "benchmark_report" in st.session_state:
         st.divider()
-        st.markdown(st.session_state["rewrite_result"])
+        st.subheader("️🏆 Benchmark Results")
+
+        data = st.session_state.get("benchmark_data", {})
+        orig = data.get("original", {})
+        opt = data.get("optimized", {})
+
+        orig_timeout = (
+            "timeout" in orig.get("error", "").lower() if "error" in orig else False
+        )
+
+        if orig_timeout and "error" not in opt:
+            st.error("🚨 **Original Query Timed Out (>30 seconds)**")
+            st.success(
+                f"🚀 **Optimized Query ran in {opt.get('execution_time_ms', 0):.2f} ms!**"
+            )
+            st.markdown(
+                "The original query was so inefficient it hit the database kill-switch. The optimized query prevented a major bottleneck!"
+            )
+        elif "error" not in orig and "error" not in opt:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.metric(
+                    "Original Execution Time",
+                    f"{orig['execution_time_ms']:.3f} ms",
+                )
+                st.metric("Original Total Cost", f"{orig['total_cost']:.2f}")
+            with col_b:
+                exec_delta = orig["execution_time_ms"] - opt["execution_time_ms"]
+                cost_delta = orig["total_cost"] - opt["total_cost"]
+                st.metric(
+                    "Optimized Execution Time",
+                    f"{opt['execution_time_ms']:.3f} ms",
+                    delta=(
+                        f"-{exec_delta:.3f} ms"
+                        if exec_delta > 0
+                        else f"+{abs(exec_delta):.3f} ms"
+                    ),
+                    delta_color="normal" if exec_delta > 0 else "inverse",
+                )
+                st.metric(
+                    "Optimized Total Cost",
+                    f"{opt['total_cost']:.2f}",
+                    delta=(
+                        f"-{cost_delta:.2f}"
+                        if cost_delta > 0
+                        else f"+{abs(cost_delta):.2f}"
+                    ),
+                    delta_color="normal" if cost_delta > 0 else "inverse",
+                )
+
+        with st.expander("View Full Detailed Report"):
+            st.markdown(st.session_state["benchmark_report"])
 
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
@@ -727,15 +776,24 @@ with st.sidebar:
         placeholder="SELECT * FROM lineitem LIMIT 5;",
     )
 
-    if st.button("Execute", use_container_width=True, key="manual_exec_btn"):
+    if st.button("Execute", width="stretch", key="manual_exec_btn"):
         if manual_query.strip():
+            logger.info(
+                "User executing manual query from sidebar (length: %d)",
+                len(manual_query.strip()),
+            )
             with st.spinner("Executing..."):
                 cols, rows, err = execute_sql_directly(manual_query.strip())
                 if err:
+                    logger.error("Manual query execution failed: %s", err)
                     st.session_state["manual_result"] = ("error", err)
                 elif not rows:
+                    logger.info("Manual query execution succeeded (0 rows)")
                     st.session_state["manual_result"] = ("empty", cols)
                 else:
+                    logger.info(
+                        "Manual query execution succeeded (%d rows returned)", len(rows)
+                    )
                     st.session_state["manual_result"] = ("data", cols, rows)
         else:
             st.warning("Please enter a query")
@@ -749,4 +807,4 @@ with st.sidebar:
             st.info("Query returned no rows.")
         else:
             _, cols, rows = result
-            st.dataframe(pd.DataFrame(rows, columns=cols), use_container_width=True)
+            st.dataframe(pd.DataFrame(rows, columns=cols), width="stretch")
